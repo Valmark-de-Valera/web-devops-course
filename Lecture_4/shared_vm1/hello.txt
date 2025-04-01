@@ -1,0 +1,2 @@
+HELLO FROM VM1 provisioning
+HELLO FROM vm1 provisioning
