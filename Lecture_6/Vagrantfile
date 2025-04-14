@@ -1,0 +1,182 @@
+# Якщо файл додаткового диску ще не існує, створюємо його.
+extra_disk = "extra-disk.qcow2"
+unless File.exist?(extra_disk)
+  puts "Створення додаткового диску #{extra_disk} розміром 5ГБ..."
+  system("qemu-img create -f qcow2 #{extra_disk} 5G")
+end
+
+Vagrant.configure("2") do |config|
+#   config.vm.box = "bento/ubuntu-20.04"
+#   config.vm.box_version = "202303.13.0"
+#
+#   config.vm.provider "virtualbox" do |vb|
+#     vb.memory = 1024
+#     vb.cpus = 1
+#   end
+
+  config.vm.box = "perk/ubuntu-20.04-arm64"
+#   config.vm.network :forwarded_port, guest: 22, host: 50022, auto_correct: true
+
+
+  # Сказати Vagrant явно використати qemu
+  config.vm.provider :qemu do |qemu|
+    qemu.qemu_bin = "/usr/local/bin/qemu-system-aarch64"
+    qemu.memory = 1024
+    qemu.cpus   = 1
+
+    qemu.extra_qemu_args = [
+      "-drive", "if=none,file=#{extra_disk},format=qcow2,id=hd2",
+      "-device", "virtio-blk,drive=hd2"
+    ]
+  end
+
+  config.vm.provision "shell", name: "Update System" do |sh|
+    sh.inline = <<-SHELL
+      echo "=== [STEP 1] Оновлення системи ==="
+      sudo apt-get update -y
+      sudo apt-get upgrade -y
+    SHELL
+  end
+
+  config.vm.provision "shell", name: "Install Nginx (Official)" do |sh|
+    sh.inline = <<-SHELL
+      echo "=== [STEP 2] Встановлення Nginx з офіційних реп ==="
+      sudo apt-get install -y nginx
+      sudo nginx -v
+    SHELL
+  end
+
+  config.vm.provision "shell", name: "Add PPA Nginx" do |sh|
+    sh.inline = <<-SHELL
+      echo "=== [STEP 3] Додавання PPA для Nginx ==="
+      sudo apt-get install -y software-properties-common
+      sudo add-apt-repository -y ppa:nginx/stable
+      sudo apt-get update -y
+
+      echo "=== Оновлюємо до версії з PPA (якщо вона новіша) ==="
+      sudo apt-get install -y nginx
+      sudo nginx -v
+    SHELL
+  end
+
+  config.vm.provision "shell", name: "Install ppa-purge and purge" do |sh|
+    sh.inline = <<-SHELL
+      echo "=== [STEP 4] Встановлюємо ppa-purge ==="
+      sudo apt-get install -y ppa-purge
+      sudo apt-get install -y aptitude
+
+      sudo ppa-purge ppa:nginx/stable --apt aptitude # requires --yes
+      sudo nginx -v
+    SHELL
+  end
+
+  config.vm.provision "shell", name: "Create systemd service" do |sh|
+    sh.inline = <<-SHELL
+      echo "=== [STEP 5] Створення systemd-сервісу ==="
+
+      sudo bash -c 'cat > /usr/local/bin/date_loop.sh <<EOF
+#!/usr/bin/env bash
+while true; do
+  echo "[$(date)] Service is running..." >> /var/log/date_loop.log
+  sleep 60
+done
+EOF'
+      sudo chmod +x /usr/local/bin/date_loop.sh
+
+      sudo bash -c 'cat > /etc/systemd/system/date-loop.service <<EOF
+[Unit]
+Description=Infinite loop logging date to /var/log/date_loop.log
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/date_loop.sh
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF'
+
+      sudo systemctl daemon-reload
+      sudo systemctl enable date-loop.service
+      sudo systemctl start date-loop.service
+
+#       sudo systemctl disable date-loop.service
+    SHELL
+  end
+
+  config.vm.provision "shell", name: "Setup Firewall and Fail2Ban" do |sh|
+    sh.inline = <<-SHELL
+      echo "=== [STEP 6] Firewall (ufw) і Fail2Ban ==="
+      sudo apt-get install -y ufw fail2ban
+
+      cat <<EOF | sudo tee /etc/fail2ban/jail.d/custom.conf
+[DEFAULT]
+bantime  = 30m
+findtime = 10m
+maxretry = 5
+ignoreip = 127.0.0.1/8 ::1
+
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = /var/log/auth.log
+EOF
+
+      # Налаштування ufw (все закрити, крім SSH, HTTP/HTTPS)
+      sudo ufw default deny incoming
+      sudo ufw default allow outgoing
+      sudo ufw allow http
+      sudo ufw allow https
+      echo "y" | sudo ufw enable
+
+      sudo ufw allow from 10.0.2.2 to any port 22
+      sudo ufw deny from 203.0.113.50 to any port 22
+
+      sudo systemctl enable fail2ban
+      sudo systemctl start fail2ban
+
+      echo "=== Установка та налаштування завершені! ==="
+    SHELL
+  end
+
+  config.vm.provision "shell", name: "Setup New Disk" do |sh|
+    sh.inline = <<-'SHELL'
+      echo "=== [STEP 7] Налаштування нового диску ==="
+
+      if [ -b /dev/vda ] && [ ! -b /dev/vda1 ]; then
+        DISK=/dev/vda
+      else
+        echo "Додатковий диск не знайдено або він вже використовується. Перевірте налаштування QEMU."
+        exit 1
+      fi
+
+      echo "Додатковий диск знайдено: $DISK"
+
+      echo "=== Створення GPT-мітки на $DISK ==="
+      sudo parted $DISK --script mklabel gpt
+
+      echo "=== Створення primary розділу на $DISK, який займає весь диск ==="
+      sudo parted $DISK --script mkpart primary ext4 0% 100%
+      sudo partprobe $DISK
+      sleep 3
+
+      PART="${DISK}1"
+      echo "=== Форматування розділу $PART в ext4 ==="
+      sudo mkfs.ext4 -F $PART
+
+      echo "=== Створення точки монтування: /mnt/storage ==="
+      sudo mkdir -p /mnt/storage
+
+      echo "=== Додавання запису до /etc/fstab для автоматичного монтування ==="
+      UUID=$(sudo blkid -s UUID -o value $PART)
+      echo "UUID=${UUID} /mnt/storage ext4 defaults 0 2" | sudo tee -a /etc/fstab
+
+      echo "=== Монтування нового розділу ==="
+      sudo mount -a
+
+      echo "=== Налаштування нового диску завершено ==="
+    SHELL
+  end
+
+end
